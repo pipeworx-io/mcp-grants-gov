@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-grants-gov",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Grants.gov MCP — open federal grant opportunities (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-671eb104fcca50f3eff7d54f17431de8e700cdf62cae8639b4c12b8651223d4e",
-    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
+    "sourceHash": "v1-be925a6e6350a16b702fd0c26a84dc08a92ebe3529b5908765bf64aeb6a04074",
+    "sourceCommit": "d82b03e5d3bf01fd0dfba214ff31dabe330f2ab6"
   }
 }

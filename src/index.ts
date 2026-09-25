@@ -672,7 +672,9 @@ const tools: McpToolExport['tools'] = [
           type: 'string',
           description: 'forecasted | posted | closed | archived (default posted; use a pipe to combine, e.g. "posted|forecasted")',
         },
-        agencies: { type: 'string', description: 'Comma-separated agency codes (e.g., "EPA,USDA,NIH")' },
+        open_only: { type: 'boolean', description: 'true restricts to currently-open or forthcoming opportunities (same as status "posted|forecasted"); omit or false leaves status at its default. Alias for status when a caller only knows open/not-open, not the exact status vocabulary.' },
+        agencies: { type: 'string', description: 'Comma-separated agency codes (e.g., "EPA,USDA,NIH"). A parent department code (e.g. "HHS") also matches its sub-agencies (NIH, CDC, FDA, ...) — Grants.gov indexes opportunities under the posting sub-agency, not just the department.' },
+        agency: { type: 'string', description: 'Alias for `agencies` — a single agency or department code (e.g. "NIH" or "HHS").' },
         funding_categories: {
           type: 'string',
           description: 'Comma-separated category codes (e.g., "ED" education, "ENV" environment, "ST" science)',
@@ -735,14 +737,16 @@ async function grantsPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function searchOpps(args: Record<string, unknown>) {
+  const status = (args.status as string) ?? (args.open_only === true ? 'posted|forecasted' : 'posted');
   const body: Record<string, unknown> = {
     rows: Math.min(1000, Math.max(1, (args.limit as number) ?? 25)),
     startRecordNum: (args.offset as number) ?? 0,
     sortBy: 'openDate|desc',
-    oppStatuses: (args.status as string) ?? 'posted',
+    oppStatuses: status,
   };
   if (args.keyword) body.keyword = String(args.keyword);
-  if (args.agencies) body.agencies = String(args.agencies);
+  const agencies = args.agencies ?? args.agency;
+  if (agencies) body.agencies = String(agencies);
   if (args.funding_categories) body.fundingCategories = String(args.funding_categories);
   if (args.aln) body.cfda = String(args.aln);
 
