@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -667,14 +702,18 @@ const tools: McpToolExport['tools'] = [
     inputSchema: {
       type: 'object',
       properties: {
-        keyword: { type: 'string', description: 'Full-text query' },
+        keyword: {
+          type: 'string',
+          description:
+            'Grants.gov\'s own keyword match behaves like an exact/AND phrase across title and synopsis text, not a relevance-ranked full-text search — a compound multi-concept phrase (e.g. joining three unrelated nouns) routinely matches ZERO opportunities even when relevant ones are open (verified live 2026-09-25, fleet #2450: "cancer liquid biopsy diagnostic" -> 0 hits; the single word "SBIR" -> 29 hits including the exact NIH SBIR/STTR hub the compound phrase was trying to find). Prefer ONE short, salient term ("SBIR", "liquid biopsy", "wastewater") and narrow with `agencies`/`funding_categories`/`status` instead of cramming every concept into this field. A zero-hit result is worth one retry with a shorter keyword before concluding nothing is open.',
+        },
         status: {
           type: 'string',
           description: 'forecasted | posted | closed | archived (default posted; use a pipe to combine, e.g. "posted|forecasted")',
         },
         open_only: { type: 'boolean', description: 'true restricts to currently-open or forthcoming opportunities (same as status "posted|forecasted"); omit or false leaves status at its default. Alias for status when a caller only knows open/not-open, not the exact status vocabulary.' },
-        agencies: { type: 'string', description: 'Comma-separated agency codes (e.g., "EPA,USDA,NIH"). A parent department code (e.g. "HHS") also matches its sub-agencies (NIH, CDC, FDA, ...) — Grants.gov indexes opportunities under the posting sub-agency, not just the department.' },
-        agency: { type: 'string', description: 'Alias for `agencies` — a single agency or department code (e.g. "NIH" or "HHS").' },
+        agencies: { type: 'string', description: 'Comma-separated agency codes (e.g., "EPA,USDA" or a bare department like "HHS" or "NIH"). Grants.gov itself indexes opportunities under a FULLY-QUALIFIED sub-agency code ("HHS-NIH11", "HHS-CDC1", ...), and its own filter returns ZERO hits for a bare department code (verified live 2026-09-25, fleet #2450) — this tool detects a bare code automatically and matches it client-side against every hit\'s sub-agency code instead of sending it upstream, so "HHS" still finds NIH/CDC/FDA opportunities. A code you already have in the full "DEPT-SUBAGENCY#" form is sent upstream unchanged.' },
+        agency: { type: 'string', description: 'Alias for `agencies` — a single agency or department code (e.g. "NIH" or "HHS"; see `agencies` for how a bare code is matched).' },
         funding_categories: {
           type: 'string',
           description: 'Comma-separated category codes (e.g., "ED" education, "ENV" environment, "ST" science)',
@@ -738,15 +777,39 @@ async function grantsPost<T>(path: string, body: unknown): Promise<T> {
 
 async function searchOpps(args: Record<string, unknown>) {
   const status = (args.status as string) ?? (args.open_only === true ? 'posted|forecasted' : 'posted');
+  const requestedRows = Math.min(1000, Math.max(1, (args.limit as number) ?? 25));
+  const requestedOffset = Math.max(0, (args.offset as number) ?? 0);
+
+  const rawAgencies = args.agencies ?? args.agency;
+  const wantedAgencies = rawAgencies
+    ? String(rawAgencies).split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  // A code is "bare" when Grants.gov's own filter cannot use it (see
+  // agencyMatches' header) — anything without a hyphen, since every real
+  // sub-agency code observed live is DEPT-SUBAGENCY#, e.g. "HHS-NIH11".
+  const bareAgencies = wantedAgencies.filter((a) => !a.includes('-'));
+  const needsClientSideAgencyFilter = bareAgencies.length > 0;
+
   const body: Record<string, unknown> = {
-    rows: Math.min(1000, Math.max(1, (args.limit as number) ?? 25)),
-    startRecordNum: (args.offset as number) ?? 0,
+    // When any wanted code is bare, upstream's own agencies filter cannot
+    // resolve it (verified live: {agencies:"HHS"} -> hitCount 0 despite open
+    // HHS-NIH* opportunities) — so ask for a full page and filter client-side
+    // below instead of asking upstream to do something it cannot do. 1000 is
+    // the documented upstream max; sortBy keeps the page deterministic run to
+    // run so client-side pagination (offset applied after filtering) is stable.
+    rows: needsClientSideAgencyFilter ? 1000 : requestedRows,
+    startRecordNum: needsClientSideAgencyFilter ? 0 : requestedOffset,
     sortBy: 'openDate|desc',
     oppStatuses: status,
   };
   if (args.keyword) body.keyword = String(args.keyword);
-  const agencies = args.agencies ?? args.agency;
-  if (agencies) body.agencies = String(agencies);
+  // Only pass agencies upstream when EVERY wanted code is already fully
+  // qualified — mixing a bare and a qualified code and asking upstream to
+  // OR them together is not something search2 is known to do correctly, so
+  // a mix falls through to client-side filtering for all of them instead.
+  if (wantedAgencies.length && !needsClientSideAgencyFilter) {
+    body.agencies = wantedAgencies.join(',');
+  }
   if (args.funding_categories) body.fundingCategories = String(args.funding_categories);
   if (args.aln) body.cfda = String(args.aln);
 
@@ -763,12 +826,77 @@ async function searchOpps(args: Record<string, unknown>) {
     throw new Error(`Grants.gov: ${data.msg ?? 'unknown error'}`);
   }
 
-  const hits = data.data?.oppHits ?? [];
+  const rawHits = data.data?.oppHits ?? [];
+
+  if (!needsClientSideAgencyFilter) {
+    return {
+      total: data.data?.hitCount ?? 0,
+      returned: rawHits.length,
+      opportunities: rawHits.map(normalizeHit),
+    };
+  }
+
+  const matched = rawHits.filter((h) => agencyMatches(h.agencyCode, wantedAgencies));
+  const page = matched.slice(requestedOffset, requestedOffset + requestedRows);
   return {
-    total: data.data?.hitCount ?? 0,
-    returned: hits.length,
-    opportunities: hits.map(normalizeHit),
+    // Honest, not fabricated: this counts matches within the page upstream
+    // actually returned (up to 1000, the docs' own max), not a full-catalog
+    // total — the same distinction `truncated`/`shortfall` exist for
+    // elsewhere in the catalog. Upstream gave no way to ask for an exact
+    // department-level count directly.
+    total: matched.length,
+    returned: page.length,
+    opportunities: page.map(normalizeHit),
+    agency_filter_note:
+      `"${wantedAgencies.join(',')}" matched client-side against sub-agency codes in the ` +
+      `${rawHits.length} upstream hits for this status/keyword (Grants.gov's own agencies filter ` +
+      'needs a fully-qualified code like "HHS-NIH11", not a bare department code) — total reflects ' +
+      'matches within that page, not an exact full-catalog count for the department.',
   };
+}
+
+/**
+ * Does an opportunity's agency code satisfy one of the wanted codes?
+ *
+ * Grants.gov's real `agencyCode` values are DEPT-SUBAGENCY#, e.g.
+ * "HHS-NIH11", "HHS-CDC1", "DOD-AMRAA" — verified live 2026-09-25 (fleet
+ * #2450) by searching with no agency filter and reading back real hits'
+ * `agencyCode`. A caller (or the router picking arguments for them) very
+ * reasonably passes the bare department ("HHS", "NIH", "EPA") the way every
+ * OTHER agency-filtered pack in this catalog accepts it — Grants.gov's own
+ * `agencies` filter param does not accept that shape and returns hitCount 0
+ * rather than erroring, which is indistinguishable from "nothing is open"
+ * unless you already know to suspect the filter itself.
+ *
+ * Matches on: exact equality; the wanted code as a `-`-delimited segment of
+ * the hit's code (so "HHS" matches segment "HHS" of "HHS-NIH11", and "NIH"
+ * matches a segment that STARTS WITH "NIH" — "NIH11" — since the numeric
+ * suffix varies by sub-agency and is not itself part of any recognizable
+ * department code, so requiring segment equality would only ever match
+ * "NIH" against nothing); or the hit code starting with `wanted-` (handles a
+ * caller who already supplies the department-subagency prefix, e.g.
+ * "HHS-NIH", without the trailing number).
+ *
+ * The segment-PREFIX form (`seg.startsWith(w)`, for the numeric-suffix case
+ * above) only fires for a wanted code of 3+ characters — real department/
+ * sub-agency abbreviations run 2-4 letters, so at 2 characters segment-prefix
+ * matching starts producing false positives (a 2-letter code as a prefix of
+ * an unrelated 4-6 letter segment, e.g. wanted "NI" would otherwise match
+ * USDA's "NIFA" segment). Exact segment/whole-code equality still applies at
+ * any length, so a real 2-letter code ("ED", department of Education) still
+ * matches an upstream code that uses it as a whole segment.
+ */
+function agencyMatches(hitCode: string | undefined, wanted: string[]): boolean {
+  if (!hitCode) return false;
+  const upper = hitCode.trim().toUpperCase();
+  if (!upper) return false;
+  const segments = upper.split('-');
+  return wanted.some((raw) => {
+    const w = raw.trim().toUpperCase();
+    if (!w) return false;
+    if (upper === w || upper.startsWith(`${w}-`)) return true;
+    return segments.some((seg) => seg === w || (w.length >= 3 && seg.startsWith(w)));
+  });
 }
 
 async function getOpp(opportunityId: number) {
