@@ -677,9 +677,38 @@ function collapse(s: string): string {
  * the federal-wide clearinghouse for currently-open and forecasted opportunities.
  *
  * API: https://www.grants.gov/web/grants/s2s/grantor/schemas/grants-gov-search2.html
- * Tools:
+ * Tools (live proxy, currently-open coverage only):
  * - search_opportunities: filter by keyword, status, agency, funding category, dates
  * - get_opportunity:      single full record with attachments and synopsis text
+ *
+ * Tools (local mirror, fleet #2512 — closed/archived/forecasted history the
+ * live API structurally cannot serve):
+ * - search_historical_opportunities: agency/CFDA/keyword/status (incl. closed
+ *   and forecasted)/date-range search over the FULL extract, back to 2004.
+ * - get_historical_opportunity:      one record from the mirror, any status.
+ * - agency_posting_trend:            an agency's opportunity count / funding
+ *   by fiscal year, derived from post_date.
+ *
+ * WHY A MIRROR FOR HISTORY: search2 (BASE_URL below) is Grants.gov's live
+ * index and only usefully answers "what is open or about to open right
+ * now" — there is no live endpoint for "what did this agency post five
+ * fiscal years ago" or "what was forecasted but never opened". Per Bruce's
+ * 2026-09-23 ruling ("build a copy when live doesn't serve"), the historical
+ * tools below read migration 226's grants_gov_opportunities, loaded from
+ * Grants.gov's own daily full-catalog XML export
+ * (grants.gov/xml-extract -> prod-grants-gov-chatbot.s3.amazonaws.com,
+ * verified live 2026-09-30: 83,497 records, no auth) by
+ * scripts/grants-gov-upsert.sh via .github/workflows/grants-gov-refresh.yml.
+ * `data_as_of` is on every mirror response (the last successful refresh,
+ * read from grants_gov_ingest_runs via the grants_gov_coverage() RPC).
+ * The live tools (search_opportunities/get_opportunity) are UNCHANGED —
+ * they still proxy search2 for the "what's open right now" case, which the
+ * mirror (refreshed once daily) is never quite fresh enough for.
+ *
+ * NO NEW PERSONAL DATA: the mirror carries GrantorContactName/Text, an
+ * agency's published point-of-contact for the opportunity — the same class
+ * of disclosure get_opportunity's live GrantorContact* fields already
+ * surface; see the migration file for the full reasoning.
  */
 
 
@@ -740,6 +769,63 @@ const tools: McpToolExport['tools'] = [
       required: ['opportunity_id'],
     },
   },
+  {
+    name: 'search_historical_opportunities',
+    description:
+      'Search Grants.gov\'s FULL opportunity history (closed and archived opportunities back to 2004, plus forecasted opportunities not yet posted) — coverage search_opportunities\' live API cannot serve, since search2 only usefully answers "what is open right now". Covers Grants.gov\'s full catalog, refreshed once a day (see `data_as_of`). Filter by agency code, CFDA/Assistance Listing number, keyword (full-text over title + description), status, opportunity category, or post-date range. Unlike search_opportunities, status here defaults to EVERY status, not just "posted" — pass status explicitly to narrow. Answers "what did this agency fund last fiscal year", "what opportunities under CFDA 93.351 have ever closed", "what is forecasted for next year that hasn\'t posted yet".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agency_code: {
+          type: 'string',
+          description: 'Agency or sub-agency code, e.g. "NIH" or "HHS-NIH11" or "DOS". Matches as a prefix/segment against the fully-qualified codes on file (same bare-vs-qualified forgiveness as search_opportunities\' `agencies`). Alias: agency.',
+        },
+        agency: { type: 'string', description: 'Alias for agency_code.' },
+        cfda: { type: 'string', description: 'Assistance Listing Number / CFDA number, exact match, e.g. "93.351". Alias: aln.' },
+        aln: { type: 'string', description: 'Alias for cfda.' },
+        keyword: { type: 'string', description: 'Full-text search over the opportunity title and description (PostgreSQL websearch syntax — quote a phrase, "-word" to exclude). More forgiving than the live tool\'s exact-phrase keyword match.' },
+        status: {
+          type: 'string',
+          description: 'posted | closed | archived | forecasted. Omit to search every status, unlike the live tool (whose default is "posted").',
+        },
+        opportunity_category: { type: 'string', description: 'Single-letter Grants.gov category code: D discretionary, M mandatory, C continuation, E earmark, O other.' },
+        post_date_from: { type: 'string', description: 'Only opportunities posted on/after this date, YYYY-MM-DD.' },
+        post_date_to: { type: 'string', description: 'Only opportunities posted on/before this date, YYYY-MM-DD.' },
+        limit: { type: 'number', description: 'Rows to return, 1-500 (default 25).' },
+        offset: { type: 'number', description: '0-based start record, for paging.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'get_historical_opportunity',
+    description:
+      'Fetch one Grants.gov opportunity by its numeric opportunity ID, in ANY status (open, closed, archived, or forecasted) — unlike get_opportunity, which calls the live API and only reliably resolves currently-open opportunities. Returns the full record plus a computed `status` (derived from close/archive dates against today, the same vocabulary search_historical_opportunities uses) and `data_as_of`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        opportunity_id: {
+          type: 'number',
+          description: 'Numeric opportunity ID (returned by search_historical_opportunities or search_opportunities as "id").',
+        },
+      },
+      required: ['opportunity_id'],
+    },
+  },
+  {
+    name: 'agency_posting_trend',
+    description:
+      'An agency\'s opportunity-posting trend by federal fiscal year (Oct-Sep): how many opportunities it posted, total estimated program funding, and average award ceiling, per year. Answers "is this agency posting more or fewer opportunities than last year" and "how has this agency\'s funding trended". Fiscal year is derived from each opportunity\'s post_date.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agency_code: { type: 'string', description: 'Agency or sub-agency code, e.g. "EPA", "NIH", "HHS-CDC1". Matches as a prefix/segment, same forgiveness as search_historical_opportunities. Alias: agency.' },
+        agency: { type: 'string', description: 'Alias for agency_code.' },
+        years: { type: 'number', description: 'Number of most-recent fiscal years to return, 1-40 (default 10).' },
+      },
+      required: [],
+    },
+  },
 ];
 
 function reqNum(args: Record<string, unknown>, key: string, example: string): number {
@@ -751,7 +837,12 @@ function reqNum(args: Record<string, unknown>, key: string, example: string): nu
   return n;
 }
 
+const MIRROR_TOOLS = new Set(['search_historical_opportunities', 'get_historical_opportunity', 'agency_posting_trend']);
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  if (MIRROR_TOOLS.has(name)) {
+    return callMirrorTool(name, args);
+  }
   switch (name) {
     case 'search_opportunities':
       return searchOpps(args);
@@ -1008,6 +1099,236 @@ function normalizeDetail(d: OpportunityDetail) {
     ),
     grants_gov_url: d.id ? `https://www.grants.gov/search-results-detail/${d.id}` : null,
   };
+}
+
+/* ----------------------------------------------------- mirror (local DB) */
+
+interface DbConfig {
+  url: string;
+  key: string;
+}
+
+async function sbRpc(cfg: DbConfig, fn: string, body: Record<string, unknown>): Promise<unknown[]> {
+  const url = `${cfg.url}/rest/v1/rpc/${fn}`;
+  const res = await pwFetch(url, {
+    method: 'POST',
+    headers: {
+      apikey: cfg.key,
+      Authorization: `Bearer ${cfg.key}`,
+      'Content-Type': 'application/json',
+      Prefer: 'params=single-object',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await httpError(res, 'Grants.gov historical data');
+  const parsed = await res.json();
+  if (!Array.isArray(parsed)) {
+    throw new Error('Grants.gov historical data: RPC did not return a row array — treating this as a failure.');
+  }
+  return parsed;
+}
+
+let cachedDataAsOf: { value: string | null; coverage: Record<string, unknown> | null } | undefined;
+
+/** The last successful refresh + coverage stats, read once per Worker instance and reused across calls. */
+async function mirrorCoverage(cfg: DbConfig): Promise<{ value: string | null; coverage: Record<string, unknown> | null }> {
+  if (cachedDataAsOf !== undefined) return cachedDataAsOf;
+  try {
+    const rows = (await sbRpc(cfg, 'grants_gov_coverage', {})) as Record<string, unknown>[];
+    const row = rows[0] ?? null;
+    cachedDataAsOf = { value: (row?.data_as_of as string | undefined) ?? null, coverage: row };
+  } catch {
+    cachedDataAsOf = { value: null, coverage: null }; // freshness is metadata, never the reason a call fails
+  }
+  return cachedDataAsOf;
+}
+
+function withDataAsOf<T extends Record<string, unknown>>(result: T, asOf: string | null): T & { data_as_of: string | null } {
+  return {
+    ...result,
+    data_as_of: asOf,
+    ...(asOf
+      ? {}
+      : {
+          coverage_status:
+            'The Grants.gov historical dataset has not completed its first load yet — results may be empty or incomplete. This is a deployment state, not a query problem.',
+        }),
+  };
+}
+
+function agencyArg(args: Record<string, unknown>): string | undefined {
+  const raw = (args.agency_code ?? args.agency) as string | undefined;
+  return raw ? String(raw).trim() : undefined;
+}
+
+interface MirrorSearchRow {
+  opportunity_id: number;
+  opportunity_title: string | null;
+  opportunity_number: string | null;
+  agency_code: string | null;
+  agency_name: string | null;
+  status: string | null;
+  post_date: string | null;
+  close_date: string | null;
+  fiscal_year: number | null;
+  cfda_numbers: string[] | null;
+  award_ceiling: number | null;
+  estimated_total_program_funding: number | null;
+  total_count: number;
+}
+
+function shapeSearchRow(r: MirrorSearchRow) {
+  return {
+    id: r.opportunity_id,
+    title: r.opportunity_title,
+    number: r.opportunity_number,
+    agency_code: r.agency_code,
+    agency: r.agency_name,
+    status: r.status,
+    post_date: r.post_date,
+    close_date: r.close_date,
+    fiscal_year: r.fiscal_year,
+    assistance_listing_numbers: r.cfda_numbers ?? [],
+    award_ceiling: r.award_ceiling,
+    estimated_total_program_funding: r.estimated_total_program_funding,
+    grants_gov_url: `https://www.grants.gov/search-results-detail/${r.opportunity_id}`,
+  };
+}
+
+async function searchHistorical(cfg: DbConfig, args: Record<string, unknown>) {
+  const limit = Math.min(500, Math.max(1, Number(args.limit) || 25));
+  const offset = Math.max(0, Number(args.offset) || 0);
+  const rows = (await sbRpc(cfg, 'grants_gov_search', {
+    p_agency_code: agencyArg(args) ?? null,
+    p_cfda: (args.cfda ?? args.aln) ? String(args.cfda ?? args.aln) : null,
+    p_keyword: args.keyword ? String(args.keyword) : null,
+    p_status: args.status ? String(args.status).toLowerCase() : null,
+    p_opportunity_category: args.opportunity_category ? String(args.opportunity_category) : null,
+    p_post_date_from: args.post_date_from ? String(args.post_date_from) : null,
+    p_post_date_to: args.post_date_to ? String(args.post_date_to) : null,
+    p_limit: limit,
+    p_offset: offset,
+  })) as MirrorSearchRow[];
+
+  return {
+    total: rows.length ? rows[0].total_count : 0,
+    returned: rows.length,
+    offset,
+    opportunities: rows.map(shapeSearchRow),
+    source: 'Grants.gov\'s own full-catalog extract, refreshed daily — covers every status, not just currently-open (see search_opportunities for the live-only view).',
+  };
+}
+
+async function getHistorical(cfg: DbConfig, opportunityId: number) {
+  const rows = (await sbRpc(cfg, 'grants_gov_get', { p_opportunity_id: opportunityId })) as Record<string, unknown>[];
+  const row = rows[0];
+  if (!row) {
+    return {
+      found: false,
+      reason: `No opportunity with id ${opportunityId} in Grants.gov's historical dataset.`,
+      hint: 'Check the id with search_historical_opportunities, or the id may belong to an opportunity type not yet loaded.',
+    };
+  }
+  const status =
+    row.record_type === 'forecast'
+      ? 'forecasted'
+      : !row.close_date || (row.close_date as string) >= new Date().toISOString().slice(0, 10)
+        ? 'posted'
+        : !row.archive_date || (row.archive_date as string) >= new Date().toISOString().slice(0, 10)
+          ? 'closed'
+          : 'archived';
+  return {
+    found: true,
+    id: row.opportunity_id,
+    record_type: row.record_type,
+    status,
+    title: row.opportunity_title,
+    number: row.opportunity_number,
+    category: row.opportunity_category,
+    funding_instrument_type: row.funding_instrument_type,
+    funding_activity_categories: row.category_of_funding_activity ?? [],
+    assistance_listing_numbers: row.cfda_numbers ?? [],
+    eligible_applicant_codes: row.eligible_applicant_codes ?? [],
+    eligibility_note: row.additional_information_on_eligibility,
+    agency_code: row.agency_code,
+    agency: row.agency_name,
+    post_date: row.post_date,
+    close_date: row.close_date,
+    archive_date: row.archive_date,
+    last_updated_date: row.last_updated_date,
+    award_ceiling: row.award_ceiling,
+    award_floor: row.award_floor,
+    estimated_total_program_funding: row.estimated_total_program_funding,
+    expected_number_of_awards: row.expected_number_of_awards,
+    description: row.description,
+    cost_sharing_required: row.cost_sharing_or_matching_requirement,
+    contact_name: row.grantor_contact_name,
+    contact_email: row.grantor_contact_email,
+    contact_phone: row.grantor_contact_phone_number,
+    fiscal_year: row.fiscal_year,
+    estimated_synopsis_post_date: row.estimated_synopsis_post_date,
+    estimated_synopsis_close_date: row.estimated_synopsis_close_date,
+    estimated_award_date: row.estimated_award_date,
+    grants_gov_url: `https://www.grants.gov/search-results-detail/${row.opportunity_id}`,
+    source: 'Grants.gov\'s own full-catalog extract, refreshed daily.',
+  };
+}
+
+interface TrendRow {
+  fiscal_year: number;
+  opportunities_posted: number;
+  total_estimated_funding: number | null;
+  avg_award_ceiling: number | null;
+}
+
+async function agencyTrend(cfg: DbConfig, args: Record<string, unknown>) {
+  const agency = agencyArg(args);
+  if (!agency) {
+    throw new Error('agency_posting_trend needs an agency code. Pass agency_code (or its alias agency), e.g. "EPA" or "HHS-NIH11".');
+  }
+  const years = Math.min(40, Math.max(1, Number(args.years) || 10));
+  const rows = (await sbRpc(cfg, 'grants_gov_agency_trend', { p_agency_code: agency, p_years: years })) as TrendRow[];
+  return {
+    agency_code: agency,
+    years_returned: rows.length,
+    trend: rows.map((r) => ({
+      fiscal_year: r.fiscal_year,
+      opportunities_posted: r.opportunities_posted,
+      total_estimated_funding: r.total_estimated_funding,
+      avg_award_ceiling: r.avg_award_ceiling,
+    })),
+    source: 'Grants.gov\'s own full-catalog extract, refreshed daily; fiscal year derived from each opportunity\'s post_date (federal FY = Oct-Sep).',
+  };
+}
+
+async function callMirrorTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  const url = (args._supabaseUrl as string | undefined)?.trim();
+  const key = (args._supabaseKey as string | undefined)?.trim();
+  if (!url || !key) {
+    throw new Error(
+      'The Grants.gov historical dataset is not configured on this deployment — an operator must enable its data credentials. This is a setup problem, not your arguments. search_opportunities/get_opportunity (the live tools) do not need this and still work.',
+    );
+  }
+  const cfg: DbConfig = { url, key };
+  const asOf = await mirrorCoverage(cfg);
+
+  let result: unknown;
+  switch (name) {
+    case 'search_historical_opportunities':
+      result = await searchHistorical(cfg, args);
+      break;
+    case 'get_historical_opportunity':
+      result = await getHistorical(cfg, reqNum(args, 'opportunity_id', '363992 (numeric ID)'));
+      break;
+    case 'agency_posting_trend':
+      result = await agencyTrend(cfg, args);
+      break;
+    default:
+      throw new Error(`Unknown tool: ${name}`);
+  }
+  return result && typeof result === 'object' && !Array.isArray(result)
+    ? withDataAsOf(result as Record<string, unknown>, asOf.value)
+    : result;
 }
 
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
