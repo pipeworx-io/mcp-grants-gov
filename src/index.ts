@@ -295,10 +295,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +686,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * Grants.gov MCP — open federal grant opportunities (free, no auth)
  *
@@ -738,7 +1002,8 @@ const tools: McpToolExport['tools'] = [
         },
         status: {
           type: 'string',
-          description: 'forecasted | posted | closed | archived (default posted; use a pipe to combine, e.g. "posted|forecasted")',
+          enum: ['posted', 'closed', 'archived', 'forecasted'],
+          description: 'posted (open for applications now) | forecasted (announced, not yet posted) | closed | archived. Default posted. There is no "open" or "active" status: use "posted". For posted plus forecasted together pass open_only: true.',
         },
         open_only: { type: 'boolean', description: 'true restricts to currently-open or forthcoming opportunities (same as status "posted|forecasted"); omit or false leaves status at its default. Alias for status when a caller only knows open/not-open, not the exact status vocabulary.' },
         agencies: { type: 'string', description: 'Comma-separated agency codes (e.g., "EPA,USDA" or a bare department like "HHS" or "NIH"). Grants.gov itself indexes opportunities under a FULLY-QUALIFIED sub-agency code ("HHS-NIH11", "HHS-CDC1", ...), and its own filter returns ZERO hits for a bare department code (verified live 2026-09-25, fleet #2450) — this tool detects a bare code automatically and matches it client-side against every hit\'s sub-agency code instead of sending it upstream, so "HHS" still finds NIH/CDC/FDA opportunities. A code you already have in the full "DEPT-SUBAGENCY#" form is sent upstream unchanged.' },
@@ -786,7 +1051,8 @@ const tools: McpToolExport['tools'] = [
         keyword: { type: 'string', description: 'Full-text search over the opportunity title and description (PostgreSQL websearch syntax — quote a phrase, "-word" to exclude). More forgiving than the live tool\'s exact-phrase keyword match.' },
         status: {
           type: 'string',
-          description: 'posted | closed | archived | forecasted. Omit to search every status, unlike the live tool (whose default is "posted").',
+          enum: ['posted', 'closed', 'archived', 'forecasted'],
+          description: 'posted (open now) | closed | archived | forecasted (not yet posted). One value. There is no "open" or "active" status: use "posted" for opportunities open for applications. Omit to search every status, unlike the live tool (whose default is "posted").',
         },
         opportunity_category: { type: 'string', description: 'Single-letter Grants.gov category code: D discretionary, M mandatory, C continuation, E earmark, O other.' },
         post_date_from: { type: 'string', description: 'Only opportunities posted on/after this date, YYYY-MM-DD.' },
@@ -837,6 +1103,7 @@ function reqNum(args: Record<string, unknown>, key: string, example: string): nu
   return n;
 }
 
+const GRANTS_STATUSES = ['posted', 'closed', 'archived', 'forecasted'];
 const MIRROR_TOOLS = new Set(['search_historical_opportunities', 'get_historical_opportunity', 'agency_posting_trend']);
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -867,7 +1134,21 @@ async function grantsPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function searchOpps(args: Record<string, unknown>) {
-  const status = (args.status as string) ?? (args.open_only === true ? 'posted|forecasted' : 'posted');
+  // fleet #3471: an off-vocabulary status ("open", "active") was sent upstream,
+  // matched nothing, and came back as total 0 with empty_reason no_match -- a
+  // confident claim the catalog held nothing. Refuse it before any query.
+  // A pipe-joined list of legal values is still accepted (the upstream syntax).
+  const statusArg = args.status == null || String(args.status).trim() === '' ? null : String(args.status).trim().toLowerCase();
+  if (statusArg !== null) {
+    const parts = statusArg.split('|').map((x) => x.trim());
+    if (parts.some((x) => !GRANTS_STATUSES.includes(x))) {
+      throw new Error(
+        `user_error: status "${String(args.status)}" is not a Grants.gov status. Use exactly one of: ${GRANTS_STATUSES.join(', ')}. ` +
+          '"posted" is what is open for applications now; "forecasted" is announced but not yet posted; use open_only: true for posted plus forecasted.',
+      );
+    }
+  }
+  const status = statusArg ?? (args.open_only === true ? 'posted|forecasted' : 'posted');
   const requestedRows = Math.min(1000, Math.max(1, (args.limit as number) ?? 25));
   const requestedOffset = Math.max(0, (args.offset as number) ?? 0);
 
@@ -920,10 +1201,16 @@ async function searchOpps(args: Record<string, unknown>) {
   const rawHits = data.data?.oppHits ?? [];
 
   if (!needsClientSideAgencyFilter) {
+    const total = data.data?.hitCount ?? 0;
     return {
-      total: data.data?.hitCount ?? 0,
+      total,
       returned: rawHits.length,
       opportunities: rawHits.map(normalizeHit),
+      // fleet #3471 audit: an unrecognised funding_categories code matches nothing
+      // upstream and read as "no opportunities" (BOGUS -> total 0, no_match).
+      ...(total === 0 && args.funding_categories
+        ? { hint: `funding_categories "${String(args.funding_categories)}" was sent upstream as given; a code Grants.gov does not recognise matches nothing, which looks identical to no opportunities. Codes are short upper-case ones such as AG, ED, ENV, HL, HU, ST, T; retry without funding_categories to confirm.` }
+        : {}),
     };
   }
 
@@ -1002,7 +1289,17 @@ async function getOpp(opportunityId: number) {
   }
   const d = data.data;
   if (!d) throw new Error(`Grants.gov: no data for opportunity ${opportunityId}`);
-
+  // fleet #3471 audit: an id the live API does not hold (closed/archived, or never
+  // existed) came back as a record of 25 nulls. That is a "not found" wearing the
+  // shape of a found record, so say so.
+  if (d.id == null && d.opportunityNumber == null && d.opportunityTitle == null) {
+    return {
+      found: false,
+      reason: 'not_found_in_live_api',
+      opportunity_id: opportunityId,
+      hint: 'The live Grants.gov API does not hold this opportunity (it may be closed or archived, or the id is wrong). Try get_historical_opportunity, which resolves an opportunity in any status.',
+    };
+  }
   return normalizeDetail(d);
 }
 
@@ -1198,11 +1495,22 @@ function shapeSearchRow(r: MirrorSearchRow) {
 async function searchHistorical(cfg: DbConfig, args: Record<string, unknown>) {
   const limit = Math.min(500, Math.max(1, Number(args.limit) || 25));
   const offset = Math.max(0, Number(args.offset) || 0);
+  const HISTORICAL_STATUSES = GRANTS_STATUSES;
+  const status = args.status == null || String(args.status).trim() === '' ? null : String(args.status).trim().toLowerCase();
+  // fleet #3404: an off-vocabulary status ("open", "active") matched nothing in
+  // the RPC and came back as a clean total:0. Refuse it, naming the legal four.
+  if (status !== null && !HISTORICAL_STATUSES.includes(status)) {
+    throw new Error(
+      `user_error: status "${String(args.status)}" is not a Grants.gov status. Use exactly one of: ${HISTORICAL_STATUSES.join(', ')}. ` +
+        '"posted" is what is open for applications now; "forecasted" is announced but not yet posted; omit status to search all four.',
+    );
+  }
+  const agencyIn = agencyArg(args);
   const rows = (await sbRpc(cfg, 'grants_gov_search', {
-    p_agency_code: agencyArg(args) ?? null,
+    p_agency_code: agencyIn ?? null,
     p_cfda: (args.cfda ?? args.aln) ? String(args.cfda ?? args.aln) : null,
     p_keyword: args.keyword ? String(args.keyword) : null,
-    p_status: args.status ? String(args.status).toLowerCase() : null,
+    p_status: status,
     p_opportunity_category: args.opportunity_category ? String(args.opportunity_category) : null,
     p_post_date_from: args.post_date_from ? String(args.post_date_from) : null,
     p_post_date_to: args.post_date_to ? String(args.post_date_to) : null,
@@ -1210,12 +1518,21 @@ async function searchHistorical(cfg: DbConfig, args: Record<string, unknown>) {
     p_offset: offset,
   })) as MirrorSearchRow[];
 
+  const agencyLooksLikeName = agencyIn !== undefined && (/\s/.test(agencyIn) || agencyIn.length > 16);
   return {
     total: rows.length ? rows[0].total_count : 0,
     returned: rows.length,
     offset,
     opportunities: rows.map(shapeSearchRow),
     source: 'Grants.gov\'s own full-catalog extract, refreshed daily — covers every status, not just currently-open (see search_opportunities for the live-only view).',
+    ...(rows.length === 0 && offset === 0
+      ? {
+          empty_reason: agencyLooksLikeName ? 'agency_not_a_code' : 'no_match',
+          hint: agencyLooksLikeName
+            ? `agency_code takes an agency CODE such as "NIH", "HHS-NIH11" or "DOS", not a name ("${agencyIn}"). Pass the code, or put the name words in \`keyword\`.`
+            : 'No opportunity in the catalog matches every filter given. Loosen one: drop status, use a bare department code (e.g. "HHS") or a shorter keyword.',
+        }
+      : {}),
   };
 }
 
