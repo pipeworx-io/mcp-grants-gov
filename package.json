@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-grants-gov",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Grants.gov MCP — open federal grant opportunities (free, no auth)",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-grants-gov": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "grants-gov"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-grants-gov.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/grants-gov",
   "pipeworx": {
-    "sourceHash": "v1-f50f98d6224512fd191b91e450f154acc44d5a59caa5058a0e9f4c36e0854fbe",
-    "sourceCommit": "445bacc5596a845c12d6945fbfcdf330ef60dcc4"
+    "mode": "gateway",
+    "slug": "grants-gov",
+    "gatewaySlug": "grants-gov",
+    "sourceHash": "v1-3e6f480fdae54d4749f3abefdc92fcc4d96d2ea12c74cf1d4fa13cfa2547c645",
+    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
   }
 }
